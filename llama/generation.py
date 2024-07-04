@@ -18,7 +18,7 @@ from fairscale.nn.model_parallel.initialize import (
 
 from llama.model import ModelArgs, Transformer
 from llama.tokenizer import ChatFormat, Dialog, Message, Tokenizer
-
+import numpy as np
 
 class CompletionPrediction(TypedDict, total=False):
     generation: str
@@ -146,25 +146,37 @@ class Llama:
             If logprobs is True, token log probabilities are computed for each generated token.
 
         """
+
+        # Retrieve model parameters
         params = self.model.params
+        # Get the batch size from the input prompts
         bsz = len(prompt_tokens)
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
+        # Determine the minimum and maximum length of the input prompts
         min_prompt_len = min(len(t) for t in prompt_tokens)
         max_prompt_len = max(len(t) for t in prompt_tokens)
         assert max_prompt_len <= params.max_seq_len
+
+        # Calculate the total length, which should not exceed the model's maximum sequence length
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
 
+        # Initialize the token matrix and fill it with PAD ID
         pad_id = self.tokenizer.pad_id
         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
         for k, t in enumerate(prompt_tokens):
             tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+        
+        # Initialize the log probabilities matrix if needed
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
 
+        # Used to track the current position during generation
         prev_pos = 0
         eos_reached = torch.tensor([False] * bsz, device="cuda")
         input_text_mask = tokens != pad_id
+
+        # Calculate log probabilities if the minimum prompt length equals the total length
         if min_prompt_len == total_len:
             logits = self.model.forward(tokens, prev_pos)
             token_logprobs = -F.cross_entropy(
@@ -174,8 +186,12 @@ class Llama:
                 ignore_index=pad_id,
             )
 
+        # Define stop tokens
         stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens))
 
+        # Loop to generate tokens at each position
+        # Jia: store the logits into a dict
+        token_logits_dict = {}
         for cur_pos in range(min_prompt_len, total_len):
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
             if temperature > 0:
@@ -190,6 +206,33 @@ class Llama:
                 input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
             )
             tokens[:, cur_pos] = next_token
+            
+            token_ids = tokens[:, prev_pos:cur_pos].flatten().tolist()
+            next_tokens_ids = next_token.flatten().tolist()
+
+            # print("Type of token_ids:", type(token_ids))
+            # print("Content of token_ids:", token_ids)
+            # print("Type of next_tokens_ids:", type(next_tokens_ids))
+            # print("Content of next_tokens_ids:", next_tokens_ids)
+
+            decoded_tokens = self.tokenizer.decode(token_ids)
+            next_tokens = self.tokenizer.decode(next_tokens_ids)
+
+            # print('Decoded Tokens:', decoded_tokens)
+            # print('next_token', next_tokens)
+
+            # Jia: store the logits into a dict
+            token_logits_dict[cur_pos] = {
+                'prev_token_ids': token_ids,
+                'prev_token': decoded_tokens,
+                'next_tokens_ids': next_tokens_ids,
+                'next_tokens': next_tokens,
+                'cur_pos': cur_pos,
+                'logits': logits, 
+                'probs': torch.softmax(logits[:, -1], dim=-1)
+            }
+
+            # Update log probabilities
             if logprobs:
                 token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
                     input=logits.transpose(1, 2),
@@ -197,13 +240,19 @@ class Llama:
                     reduction="none",
                     ignore_index=pad_id,
                 )
+
+            # Check if the end-of-sequence token has been reached
             eos_reached |= (~input_text_mask[:, cur_pos]) & (
                 torch.isin(next_token, stop_tokens)
             )
             prev_pos = cur_pos
             if all(eos_reached):
                 break
+        # # Jia
+        # for key, value in list(token_logits_dict.items())[:5]:  # Print first 5 items
+        #     print(f"Key: {key}, Value: {value}")
 
+        # Prepare the output results
         if logprobs:
             token_logprobs = token_logprobs.tolist()
         out_tokens, out_logprobs = [], []
@@ -222,9 +271,11 @@ class Llama:
                     probs = probs[:eos_idx] if logprobs else None
                 except ValueError:
                     pass
+            #Jia: debug
             out_tokens.append(toks)
             out_logprobs.append(probs)
-        return (out_tokens, out_logprobs if logprobs else None)
+
+        return out_tokens, out_logprobs if logprobs else None, token_logits_dict
 
     def text_completion(
         self,
@@ -258,7 +309,7 @@ class Llama:
         if max_gen_len is None:
             max_gen_len = self.model.params.max_seq_len - 1
         prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
-        generation_tokens, generation_logprobs = self.generate(
+        generation_tokens, generation_logprobs, token_logits_dict = self.generate(
             prompt_tokens=prompt_tokens,
             max_gen_len=max_gen_len,
             temperature=temperature,
@@ -274,8 +325,8 @@ class Llama:
                     "logprobs": logprobs_i,
                 }
                 for t, logprobs_i in zip(generation_tokens, generation_logprobs)
-            ]
-        return [{"generation": self.tokenizer.decode(t)} for t in generation_tokens]
+            ], token_logits_dict
+        return [{"generation": self.tokenizer.decode(t)} for t in generation_tokens], token_logits_dict
 
     def chat_completion(
         self,
@@ -310,7 +361,8 @@ class Llama:
         prompt_tokens = [
             self.formatter.encode_dialog_prompt(dialog) for dialog in dialogs
         ]
-        generation_tokens, generation_logprobs = self.generate(
+
+        generation_tokens, generation_logprobs, token_logits_dict = self.generate(
             prompt_tokens=prompt_tokens,
             max_gen_len=max_gen_len,
             temperature=temperature,
@@ -328,17 +380,29 @@ class Llama:
                     "logprobs": logprobs_i,
                 }
                 for t, logprobs_i in zip(generation_tokens, generation_logprobs)
-            ]
+            ], token_logits_dict, prompt_tokens
+        
         return [
             {
                 "generation": {
                     "role": "assistant",
-                    "content": self.tokenizer.decode(t),
+                    "content": self.tokenizer.decode(flatten_list(t)),
                 },
             }
             for t in generation_tokens
-        ]
+        ], token_logits_dict, prompt_tokens
 
+
+def flatten_list(nested_list):
+    if nested_list is None:
+        return nested_list
+    result = []
+    for element in nested_list:
+        if isinstance(element, list):
+            result.extend(flatten_list(element))  
+        else:
+            result.append(element)  
+    return result
 
 def sample_top_p(probs, p):
     """
