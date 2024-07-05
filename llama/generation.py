@@ -193,7 +193,7 @@ class Llama:
         # Jia: store the logits into a dict
         token_logits_dict = {}
         for cur_pos in range(min_prompt_len, total_len):
-            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos) # ([1, 1, 128256])
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
@@ -222,6 +222,8 @@ class Llama:
             # print('next_token', next_tokens)
 
             # Jia: store the logits into a dict
+            probs = torch.softmax(logits[:, -1], dim=-1)
+
             token_logits_dict[cur_pos] = {
                 'prev_token_ids': token_ids,
                 'prev_token': decoded_tokens,
@@ -229,7 +231,8 @@ class Llama:
                 'next_tokens': next_tokens,
                 'cur_pos': cur_pos,
                 'logits': logits, 
-                'probs': torch.softmax(logits[:, -1], dim=-1)
+                'cur_probs_value': probs[0, next_tokens_ids].item(),
+                'prob_vector': probs,
             }
 
             # Update log probabilities
