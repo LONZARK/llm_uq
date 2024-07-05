@@ -1,0 +1,25 @@
+line_entropies 
+
+[('Here is the answer:', 0.45220457538962366), 
+ ('', 0.044080208986997604), 
+ ('Donald Trump is the 45th President of the United States, serving from 2017 to 2021.', 0.12272447331214369), 
+ ('', 0.02683766931295395), 
+ ('He was born on June 14, 1946, in Queens, New York City.', 0.13989864262377907), 
+ ('', 0.6081928610801697), 
+ ('Trump is a businessman, real estate developer, and television personality.', 0.37254961776027684), 
+ ('', 0.9593021273612976), 
+ ('He is the chairman and CEO of The Trump Organization, a global real estate and entertainment company.', 0.6556058627503262), 
+ ('', 0.15309816598892212), 
+ ("Trump gained fame and wealth through his family's real estate business, particularly with his father Fred Trump.", 0.9610883693232954), 
+ ('', 0.7404255270957947), 
+ ('He hosted the reality television show "The Apprentice" from 2004 to 2015.', 0.28574275587870945), 
+ ('', 0.8705903887748718), ('Trump announced his candidacy for the Republican presidential nomination in 2015 and won the election in 2016.', 0.4568638829184791), 
+ ('', 0.19273769855499268), 
+ ('During his presidency, Trump implemented several policies, including tax cuts, deregulation, and a travel ban targeting several Muslim-majority countries.', 0.6093763960304069), 
+ ('', 0.01722676493227482), 
+ ('He was known for his controversial statements, tweets, and policies, which sparked widespread debate and criticism.', 0.9800978497978468), 
+ ('', 0.4515342116355896), 
+ ('Trump was impeached by the House of Representatives in December 2019, but was acquitted by the Senate in February 2020.', 0.2902851551158229), 
+ ('', 0.6400138139724731), 
+ ('He lost the 2020 presidential election to Democratic candidate Joe Biden and left office on January 20, 2021.<|eot_id|>', 0.25052188842356365)
+ ]
