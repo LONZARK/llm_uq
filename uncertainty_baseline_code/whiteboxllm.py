@@ -1,3 +1,6 @@
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
+
 import torch
 import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -29,10 +32,10 @@ def print_gpu_memory_usage():
     print("Allocated memory:", mem_allocated, "GB")
     print("Cached memory:", mem_reserved, "GB")
     # return mem_allocated, mem_reserved
-
+    
 class WhiteBoxLLM:
     VALID_MODEL_TYPES = ["AutoModelForCausalLM"]
-    VALID_UQ_METHODS = ["MSP", "MTE", "PP", "P(True)", "MCSE", "MCNSE", "PMI", "CPMI"]
+    VALID_UQ_METHODS = ["MSP", "MTE", "PP" , "P(True)", "MCSE"]# "MCNSE", "PMI", "CPMI"]
 
     def __init__(self, model_type, use_multi_gpu=False):
         if model_type not in self.VALID_MODEL_TYPES:
@@ -45,8 +48,7 @@ class WhiteBoxLLM:
         self.tokenizer = None
         self.device = None
         self.dtype = torch.bfloat16
-        
-        
+        self.max_line_lenth = 30  # The number of tokens to generate in line-level pTrue, MC sampling
 
     def load_pretrained(self, model_path, device='cpu', dtype=torch.bfloat16):
         """
@@ -84,6 +86,7 @@ class WhiteBoxLLM:
             end = time.time()
             print(f"Model loaded from path: {model_path}.")
             print(f"Time: {str(end-start)} seconds")  
+
         
     def tokenize_input(self, prompt, mode="text", add_special_tokens=True, tokenize=True):
         """
@@ -122,7 +125,7 @@ class WhiteBoxLLM:
         else:
             return self.tokenizer.convert_ids_to_tokens(encoding.input_ids[0])  # Returns list of token values
 
-    def generate(self, input, max_new_tokens=512, temperature=1.0, top_p=0.9, top_k=50, do_sample=False, return_type='raw'):
+    def generate(self, input, max_new_tokens=512, temperature=1.0, top_p=None, top_k=None, do_sample=False, add_special_tokens = True, return_type='raw'):
         """
         Generate text using the loaded model.
 
@@ -150,18 +153,17 @@ class WhiteBoxLLM:
         
         
         # Handling different input types
-        if isinstance(input, dict):  # Input is a dict, as the direct input of model.generate()
-            if 'input_ids' not in input:
-                raise ValueError("The input dictionary must contain 'input_ids'.")
-            tokenized_input = input
-        elif isinstance(input, list):  # Assuming input is a chat object
+
+        if isinstance(input, list):  # Assuming input is a chat object
             if not is_chat(input):
                 raise ValueError("The list input must be a valid chat format.")
-            tokenized_input = self.tokenize_input(input, mode='chat', add_special_tokens=True, tokenize=True)
+            tokenized_input = self.tokenize_input(input, mode='chat', add_special_tokens=add_special_tokens, tokenize=True)
         elif isinstance(input, str):  # Input is a plain text string
-            tokenized_input = self.tokenize_input(input, mode='text', add_special_tokens=True, tokenize=True)
+            tokenized_input = self.tokenize_input(input, mode='text', add_special_tokens=add_special_tokens, tokenize=True)
+        elif 'input_ids' in input:  # Input contains input ids for the tokens in the input sequence, i.e.,input has been tokenized
+            tokenized_input = input
         else:
-            raise ValueError("Input format not supported. It must be either a dict, list (chat), or string (text).")
+            raise ValueError("Input format not supported. It must be either a dict, list (chat), or string (text).") ####
 
         # set attention masks
         if 'attention_mask' not in input:
@@ -195,7 +197,7 @@ class WhiteBoxLLM:
             pred_logprobs = tuple(torch.nn.functional.log_softmax(score, dim=1) for score in output.scores)
             return pred_logprobs
         
-        
+
         input_len = input_ids.size(1)
         
         output_ids = output.sequences[0]  
@@ -252,7 +254,7 @@ class WhiteBoxLLM:
     def batch_generate():
         pass
 
-    def generate_uncertainty_scores(self, generation_dict, pred_logprobs, uq_methods=None):
+    def generate_uncertainty_scores(self, generation_dict, uq_methods=None, debug=False):
         """
         Generate uncertainty scores with the specified uncertainty quantification methods.
 
@@ -277,10 +279,25 @@ class WhiteBoxLLM:
         # Create a copy of the generation_dict to uncertainty_dict
         uncertainty_dict = generation_dict.copy()
 
+        input_ids = torch.tensor([generation_dict['input_ids']])
+        attention_mask = input_ids.ne(self.tokenizer.pad_token_id).long()
+        input_dict = dict(input_ids=input_ids, attention_mask=attention_mask)
+        
+        pred_logprobs = self.generate(input_dict, max_new_tokens=512, return_type='pred_logprobs')
+
         # Iterate over uq_methods and call the corresponding method
         for method in uq_methods:
+            start_time = time.time()
+            start_time = time.perf_counter()
             # Call the method (dummy implementation)
             getattr(self, method.lower().replace('(', '').replace(')', ''))(uncertainty_dict, pred_logprobs)
+
+            temp_time = time.time()
+            temp_time = time.perf_counter()
+            if debug == True:
+                print('========', method)
+                # print('uncertainty_dict', uncertainty_dict)
+                print('running time', str(temp_time - start_time))
 
         return uncertainty_dict
 
@@ -369,7 +386,11 @@ class WhiteBoxLLM:
 
             for index in line_indices:
                 token_entropies_line.append(all_entropies[index])
-            mte_score = np.mean(token_entropies_line)
+            # mte_score = np.mean(token_entropies_line)
+            # Convert list to tensor
+            token_entropies_line_tensor = torch.tensor(token_entropies_line, device='cuda')
+            mte_score = torch.mean(token_entropies_line_tensor).tolist()
+
             new_scores = {"MTE": mte_score}
             
             # Update or append line scores
@@ -497,22 +518,22 @@ class WhiteBoxLLM:
                 found_token = True
                 break
             elif 'False' in token:
-                true_token_id = self.tokenizer('True')['input_ids'][1]
+                true_token_id = self.tokenizer('True')['input_ids'][0]
                 ptrue = pred_logprobs[index][0, true_token_id].item()
                 found_token = True
                 break
         
         # If no True or False token is found, use the first token's probability to be True
         if not found_token:
-            true_token_id = self.tokenizer('True')['input_ids'][1]
+            true_token_id = self.tokenizer('True')['input_ids'][0]
             ptrue = pred_logprobs[0][0, true_token_id].item()
-        return ptrue
+        return 1 - ptrue
 
     def ptrue(self, uncertainty_dict, pred_logprobs):
 
         input_text = uncertainty_dict['input_text']
         new_text = uncertainty_dict['new_text']
-        new_ids = generation_dict['new_ids']
+        new_ids = uncertainty_dict['new_ids']
 
         verification_prompt = f"Question: {input_text}\nProposed Answer: {new_text}\nIs the content in the proposed answer correct?\n(A) True\n(B) False\nAnswer True or False without explanation:"
         verification_prompt = self.generate_pTrue_prompt(verification_prompt)
@@ -527,6 +548,9 @@ class WhiteBoxLLM:
 
         # Linewise ptrue scores
         # Split the text into lines
+        if 'line_unc_scores' not in uncertainty_dict:
+            uncertainty_dict['line_unc_scores'] = []
+
         line_split, token_split,_,_ = self.split_lines(new_ids)
 
         token_indices_split = self.token_indices_by_line(new_ids)
@@ -538,8 +562,8 @@ class WhiteBoxLLM:
             line_verif_prompt = f"Question: {input_text}\nProposed Answer: {new_text}\nIs the sentence \"{line_text}\" in the proposed answer correct?\n(A) True\n(B) False\nAnswer True or False without explanation:"
             line_verif_prompt = self.generate_pTrue_prompt(line_verif_prompt)
 
-            line_ptrue_generation_dict = self.generate(line_verif_prompt, max_new_tokens=512, return_type='generation_dict')
-            line_ptrue_pred_logprobs = self.generate(line_verif_prompt, max_new_tokens=512, return_type='pred_logprobs')
+            line_ptrue_generation_dict = self.generate(line_verif_prompt, max_new_tokens=self.max_line_lenth, return_type='generation_dict')
+            line_ptrue_pred_logprobs = self.generate(line_verif_prompt, max_new_tokens=self.max_line_lenth, return_type='pred_logprobs')
 
             line_ptrue = self.extract_ptrue_score(line_ptrue_generation_dict, line_ptrue_pred_logprobs)
             new_scores = {"pTrue": line_ptrue}
@@ -567,11 +591,15 @@ class WhiteBoxLLM:
         
         input_text = uncertainty_dict['input_text']
         new_ids = uncertainty_dict['new_ids']
+        input_ids = torch.tensor([uncertainty_dict['input_ids']])
+        attention_mask = input_ids.ne(self.tokenizer.pad_token_id).long()
+        input_dict = dict(input_ids=input_ids, attention_mask=attention_mask)
 
         num_samples = 3
         total_logprob = 0
         for _ in range(num_samples):
-            pred_logprobs = self.generate(input_text, max_new_tokens=512, return_type='pred_logprobs')
+            # pred_logprobs = self.generate(input_text, max_new_tokens=512, return_type='pred_logprobs')
+            pred_logprobs = self.generate(input_dict, max_new_tokens=512, return_type='pred_logprobs')
 
             log_prob_list = []
             for i, log_prob_tensor in enumerate(pred_logprobs):
@@ -589,6 +617,8 @@ class WhiteBoxLLM:
 
         # Linewise ptrue scores
         # Split the text into lines
+        if 'line_unc_scores' not in uncertainty_dict:
+            uncertainty_dict['line_unc_scores'] = []
         line_split, _,_,_ = self.split_lines(new_ids)
 
         line_responce = ''
@@ -601,8 +631,8 @@ class WhiteBoxLLM:
             line_total_logprob = 0
             for _ in range(num_samples):
                 
-                temp_generation_dict = self.generate(temp_mcse_prompt, max_new_tokens=512, return_type='generation_dict')
-                temp_pred_logprobs = self.generate(temp_mcse_prompt, max_new_tokens=512, return_type='pred_logprobs')
+                temp_generation_dict = self.generate(temp_mcse_prompt, max_new_tokens=self.max_line_lenth, return_type='generation_dict')
+                temp_pred_logprobs = self.generate(temp_mcse_prompt, max_new_tokens=self.max_line_lenth, return_type='pred_logprobs')
             
                 temp_new_ids = temp_generation_dict['new_ids']
 
@@ -621,6 +651,7 @@ class WhiteBoxLLM:
             new_scores = {"MCSE": line_mcse}
 
             existing_line = next((item for item in uncertainty_dict['line_unc_scores'] if item[0] == line_text), None)
+
             if existing_line:
                 existing_line[1].update(new_scores)
             else:
@@ -633,13 +664,16 @@ class WhiteBoxLLM:
         
         input_text = uncertainty_dict['input_text']
         new_ids = uncertainty_dict['new_ids']
+        input_ids = torch.tensor([uncertainty_dict['input_ids']])
+        attention_mask = input_ids.ne(self.tokenizer.pad_token_id).long()
+        input_dict = dict(input_ids=input_ids, attention_mask=attention_mask)
 
         num_samples = 3
 
         total_normalized_logprob = 0
         for _ in range(num_samples):
             # Generate predicted log probabilities for each token in the sequence
-            pred_logprobs = self.generate(input_text, max_new_tokens=512, return_type='pred_logprobs')
+            pred_logprobs = self.generate(input_dict, max_new_tokens=512, return_type='pred_logprobs')
 
             log_prob_list = []
             sequence_length = 0  # To track the length of each generated sequence
@@ -667,6 +701,9 @@ class WhiteBoxLLM:
 
         # Linewise ptrue scores
         # Split the text into lines
+        if 'line_unc_scores' not in uncertainty_dict:
+            uncertainty_dict['line_unc_scores'] = []
+
         line_split, _,_,_ = self.split_lines(new_ids)
 
         line_responce = ''
@@ -683,8 +720,8 @@ class WhiteBoxLLM:
             line_total_normalized_logprob = 0
             for _ in range(num_samples):
                 # Generate a generation dictionary and corresponding log probabilities
-                temp_generation_dict = self.generate(temp_mcse_prompt, max_new_tokens=64, return_type='generation_dict')
-                temp_pred_logprobs = self.generate(temp_mcse_prompt, max_new_tokens=64, return_type='pred_logprobs')
+                temp_generation_dict = self.generate(temp_mcse_prompt, max_new_tokens=self.max_line_lenth, return_type='generation_dict')
+                temp_pred_logprobs = self.generate(temp_mcse_prompt, max_new_tokens=self.max_line_lenth, return_type='pred_logprobs')
                 
                 # Extract new token IDs from the generation dictionary
                 temp_new_ids = temp_generation_dict['new_ids']
@@ -739,8 +776,8 @@ class WhiteBoxLLM:
         temp_prompt = '\n'
         for i in range(len(new_ids)):
             print('temp_prompt', temp_prompt)
-            temp_generation_dict = self.generate(temp_prompt, max_new_tokens=1, return_type='generation_dict')
-            temp_pred_logprobs = self.generate(temp_prompt, max_new_tokens=1, return_type='pred_logprobs')
+            temp_generation_dict = self.generate(temp_prompt, max_new_tokens=512, return_type='generation_dict')
+            temp_pred_logprobs = self.generate(temp_prompt, max_new_tokens=512, return_type='pred_logprobs')
             temp_new_ids = temp_generation_dict['new_ids']  # List of token IDs for the generated response
             index = temp_new_ids[0]
             log_prob_list_nox.append(temp_pred_logprobs[0][0,index].item())
@@ -755,6 +792,8 @@ class WhiteBoxLLM:
 
         # Linewise ptrue scores
         # Split the text into lines
+        if 'line_unc_scores' not in uncertainty_dict:
+            uncertainty_dict['line_unc_scores'] = []
         line_split, _,_,_ = self.split_lines(new_ids)
         token_indices_split = self.token_indices_by_line(new_ids)
 
@@ -780,6 +819,15 @@ class WhiteBoxLLM:
             line_pmi = sum(line_pmi_list)/len(line_pmi_list)
 
             new_scores = {"PMI": line_pmi}
+
+            # # Check if the key exists in the dictionary
+            # if 'line_unc_scores' in uncertainty_dict:
+            #     # If the key exists, proceed to find the item
+            #     existing_line = next((item for item in uncertainty_dict['line_unc_scores'] if item[0] == line_text), None)
+            # else:
+            #     # If the key does not exist, handle the error (e.g., by logging or raising an exception)
+            #     print(f"Key 'line_unc_scores' not found in uncertainty_dict. Available keys: {list(uncertainty_dict.keys())}")
+            #     existing_line = None  # Or handle the error as appropriate
 
             existing_line = next((item for item in uncertainty_dict['line_unc_scores'] if item[0] == line_text), None)
             if existing_line:
@@ -810,8 +858,8 @@ class WhiteBoxLLM:
         temp_prompt = '\n'
         for i in range(len(new_ids)):
             print('temp_prompt', temp_prompt)
-            temp_generation_dict = self.generate(temp_prompt, max_new_tokens=1, return_type='generation_dict')
-            temp_pred_logprobs = self.generate(temp_prompt, max_new_tokens=1, return_type='pred_logprobs')
+            temp_generation_dict = self.generate(temp_prompt, max_new_tokens=512, return_type='generation_dict')
+            temp_pred_logprobs = self.generate(temp_prompt, max_new_tokens=512, return_type='pred_logprobs')
             temp_new_ids = temp_generation_dict['new_ids']  # List of token IDs for the generated response
             index = temp_new_ids[0]
             log_prob_list_nox.append(temp_pred_logprobs[0][0,index].item())
@@ -846,6 +894,9 @@ class WhiteBoxLLM:
 
         # Linewise ptrue scores
         # Split the text into lines
+        if 'line_unc_scores' not in uncertainty_dict:
+            uncertainty_dict['line_unc_scores'] = []
+
         line_split, _,_,_ = self.split_lines(new_ids)
         token_indices_split = self.token_indices_by_line(new_ids)
 
@@ -906,43 +957,46 @@ class WhiteBoxLLM:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.tolist()
         return self.tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens, clean_up_tokenization_spaces=clean_up_tokenization_spaces)
-    
-
-from datasets import load_dataset
-dataset = load_dataset("evalplus/humanevalplus")
-user_message = dataset['test'][0]['prompt']
-task_id = dataset['test'][0]['task_id']
-
-system_message = '''You are a Python code generator. Generate a complete and functioning Python function based on the provided code snippet.
-Ensure the function includes the original instructions in the comments, in-line comments for each line of code, and import statements for any required dependencies.
-Do not include main function. Enclose your code inside a ```python``` block.'''
 
 
-chat = [
-    {"role": "system", "content": system_message},
-    {"role": "user", "content": user_message}
-    ]
+# from datasets import load_dataset
+# dataset = load_dataset("evalplus/humanevalplus")
+# user_message = dataset['test'][0]['prompt']
+# task_id = dataset['test'][0]['task_id']
 
-chat = [
-    {"role": "system", "content": 'reply Hello \n world'},
-    {"role": "user", "content": 'hellp'}
-    ]
+# system_message = '''You are a Python code generator. Generate a complete and functioning Python function based on the provided code snippet.
+# Ensure the function includes the original instructions in the comments, in-line comments for each line of code, and import statements for any required dependencies.
+# Do not include main function. Enclose your code inside a ```python``` block.'''
+
+
+# chat = [
+#     {"role": "system", "content": system_message},
+#     {"role": "user", "content": user_message}
+#     ]
+
+# # chat = [
+# #     {"role": "system", "content": 'Reply in two lines'},
+# #     {"role": "user", "content": 'hello \n how are you?'}
+# #     ]
+
+# # llm = WhiteBoxLLM('AutoModelForCausalLM')
+# # llm.load_pretrained("xiaodongguaAIGC/llama-3-debug")
 
 # llm = WhiteBoxLLM('AutoModelForCausalLM')
-# llm.load_pretrained("xiaodongguaAIGC/llama-3-debug")
-
-llm = WhiteBoxLLM('AutoModelForCausalLM')
-llm.load_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-tokenized_input = llm.tokenize_input(chat, mode='chat', add_special_tokens=True, tokenize=True)
-
-# VALID_RETURN_TYPES = ['generation_text', 'generation_dict', 'pred_logprobs', 'raw']
+# llm.load_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0", use_multi_gpu=True)
 
 
-generation_text = llm.generate(chat, max_new_tokens=10, return_type='generation_text')
-generation_dict = llm.generate(chat, max_new_tokens=10, return_type='generation_dict')
-pred_logprobs = llm.generate(chat, max_new_tokens=10, return_type='pred_logprobs')
-raw = llm.generate(chat, max_new_tokens=10, return_type='raw')
-uncertainty_dict = llm.generate_uncertainty_scores(generation_dict, pred_logprobs)
 
-print('uncertainty_dict', uncertainty_dict)
+# # tokenized_input = llm.tokenize_input(chat, mode='chat', add_special_tokens=True, tokenize=True)
+# # print(type(tokenized_input))
+# # pdb.set_trace()
+# # VALID_RETURN_TYPES = ['generation_text', 'generation_dict', 'pred_logprobs', 'raw']
+
+
+# # generation_text = llm.generate(tokenized_input, max_new_tokens=512, return_type='generation_text')
+# generation_dict = llm.generate(chat, max_new_tokens=512, return_type='generation_dict')
+# # pred_logprobs = llm.generate(chat, max_new_tokens=512, return_type='pred_logprobs')
+# # raw = llm.generate(chat, max_new_tokens=512, return_type='raw')
+# uncertainty_dict = llm.generate_uncertainty_scores(generation_dict, debug=True)
+
+# print('uncertainty_dict', uncertainty_dict)
