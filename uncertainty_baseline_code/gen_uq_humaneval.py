@@ -35,9 +35,10 @@ def write_jsonll(file_path, data):
 
 MODEL_LIST = [
     # 'Meta-Llama-3-8B-Instruct',
-    # 'CodeQwen1.5-7B-chat',
     'Meta-Llama-3-70B-Instruct',
     'CodeLlama-70b-Instruct-hf'
+    'CodeQwen1.5-7B-chat',
+
 ]
 
 
